@@ -7,127 +7,235 @@ from twilio.twiml.messaging_response import MessagingResponse
 
 import gspread
 from google.oauth2.service_account import Credentials
+
 from openai import OpenAI
 
-app = Flask(__name__)
+# =========================
+# CONFIGURACIÓN INICIAL
+# =========================
 
-# ========= OpenAI =========
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("Falta la variable de entorno OPENAI_API_KEY")
+# OpenAI
+client_ai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-client_ai = OpenAI(api_key=OPENAI_API_KEY)
-
-# ========= Google Sheets =========
+# Google Sheets
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
-creds = Credentials.from_service_account_file(
-    "service_account.json",
-    scopes=SCOPES,
+# En Render subimos el secret file como `service_account.json`
+SERVICE_ACCOUNT_FILE = os.getenv(
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "/etc/secrets/service_account.json"
 )
 
-client_gs = gspread.authorize(creds)
-spreadsheet = client_gs.open("Financial Planner ADHV")
-sheet = spreadsheet.worksheet("Gastos AI")
+creds = Credentials.from_service_account_file(
+    SERVICE_ACCOUNT_FILE,
+    scopes=SCOPES
+)
+gc = gspread.authorize(creds)
 
+SPREADSHEET_NAME = "Financial Planner ADHV"
+SHEET_REGISTROS = "Gastos AI"
+SHEET_CATALOGO = "CatalogoGastos"
 
-def extraer_json_desde_texto(texto: str) -> dict:
-    """Toma la respuesta del modelo y extrae el JSON entre { ... }."""
-    start = texto.find("{")
-    end = texto.rfind("}")
-    if start == -1 or end == -1:
-        raise ValueError(f"No se encontró JSON en el texto:\n{texto}")
-    json_str = texto[start : end + 1]
-    return json.loads(json_str)
+sh = gc.open(SPREADSHEET_NAME)
+sheet_registros = sh.worksheet(SHEET_REGISTROS)
+sheet_catalogo = sh.worksheet(SHEET_CATALOGO)
 
+# =========================
+# CARGAR CATÁLOGO DE GASTOS
+# =========================
 
-def interpretar_gasto(texto: str) -> dict:
+def cargar_catalogo_desde_sheet():
     """
-    Llama a OpenAI para convertir texto libre en un JSON de gasto,
-    usando el catálogo de la pestaña 'CatalogoGastos'.
+    Lee CatalogoGastos y arma un dict:
+    {
+        "luz": {"categoria": "...", "tipo": "..."},
+        "uber": {"categoria": "...", "tipo": "..."},
+        ...
+    }
+    Normalizamos descripción a minúsculas, sin espacios alrededor.
     """
+    registros = sheet_catalogo.get_all_records()
+    catalogo = {}
 
+    for fila in registros:
+        # Tratamos de admitir varias variantes de nombres de columna
+        desc = (
+            fila.get("descripcion")
+            or fila.get("Descripción")
+            or fila.get("DESCRIPCION")
+            or fila.get("DESCRIPCIÓN")
+            or fila.get("Description")
+            or ""
+        )
+        categoria = (
+            fila.get("categoria")
+            or fila.get("Categoría")
+            or fila.get("CATEGORIA")
+            or ""
+        )
+        tipo = (
+            fila.get("tipo")
+            or fila.get("Tipo")
+            or fila.get("TIPO")
+            or ""
+        )
+
+        desc_norm = str(desc).strip().lower()
+        if desc_norm:
+            catalogo[desc_norm] = {
+                "categoria": str(categoria).strip(),
+                "tipo": str(tipo).strip(),
+            }
+
+    return catalogo
+
+
+CATALOGO_GASTOS = cargar_catalogo_desde_sheet()
+
+# =========================
+# FUNCIÓN: INTERPRETAR GASTO
+# =========================
+
+def interpretar_gasto(texto):
+    """
+    Llama a OpenAI para transformar el mensaje en un JSON con:
+    fecha, descripcion, monto, metodo_pago, tarjeta.
+
+    Luego completa concepto y tipo usando el catálogo.
+    """
     hoy = datetime.now().strftime("%Y-%m-%d")
 
-    # 1) LEER EL CATALOGO DESDE GOOGLE SHEETS
-    #    Pestaña: CatalogoGastos, columnas:
-    #    A: descripcion_base, B: categoria, C: tipo
-    sheet_catalogo = spreadsheet.worksheet("CatalogoGastos")
-    catalogo_data = sheet_catalogo.get_all_values()[1:]  # omitimos la fila de encabezados
-
-    catalogo_lineas = []
-    for fila in catalogo_data:
-        if len(fila) >= 3 and fila[0].strip():
-            desc = fila[0].strip()
-            categoria = fila[1].strip()
-            tipo = fila[2].strip()
-            catalogo_lineas.append(f"- {desc} -> categoria={categoria}, tipo={tipo}")
-
-    if catalogo_lineas:
-        catalogo_texto = "\n".join(catalogo_lineas)
-    else:
-        catalogo_texto = "(no hay filas en el catálogo)"
-
-    # 2) ARMAR EL PROMPT PARA LA IA
     prompt = f"""
-Eres un asistente que interpreta gastos personales y los clasifica
-usando un CATALOGO OFICIAL.
+Eres un asistente que extrae información de gastos a partir de mensajes en español.
 
-CATÁLOGO OFICIAL (usa la opción más parecida):
-{catalogo_texto}
+Del siguiente texto de entrada, identifica:
+- fecha del gasto (si no se menciona, usa la fecha de hoy: {hoy})
+- descripción del gasto (por ejemplo: "uber", "luz", "super", "gasolina")
+- monto en pesos mexicanos
+- método de pago (efectivo, tarjeta, transferencia, etc.)
+- tarjeta o banco si se menciona (por ejemplo: BBVA, AMEX, Banorte)
 
-INSTRUCCIONES:
+Devuelve SOLO un JSON válido con esta estructura (sin texto extra):
 
-1. A partir del texto del usuario, identifica:
-   - fecha
-   - descripcion (como la escriba la persona, limpio)
-   - monto (solo número, sin símbolo)
-   - metodo_pago (uno de: efectivo, tarjeta, transferencia, otro)
-   - tipo_tarjeta (ej: BBVA, NU, HSBC, AMEX, etc. o null si no aplica)
+{{
+  "fecha": "YYYY-MM-DD",
+  "descripcion": "texto corto",
+  "monto": 123.45,
+  "metodo_pago": "tarjeta | efectivo | transferencia | otro",
+  "tarjeta": "nombre de banco/tarjeta o vacío si no se menciona"
+}}
 
-2. Para CLASIFICAR:
-   - Compara la descripcion del gasto con las "descripcion_base" del catálogo.
-   - Elige la más parecida.
-   - Usa EXACTAMENTE la categoria y tipo que aparezcan en el catálogo.
-   - Si no encuentras nada razonable, usa:
-     categoria = "Otros"
-     tipo = "Otros"
+Texto de entrada:
+\"\"\"{texto}\"\"\""""
 
-3. Devuelve SOLO un JSON VÁLIDO con estas claves:
-   fecha, descripcion, concepto, categoria, tipo, monto, metodo_pago, tipo_tarjeta
-
-   - "concepto" puede ser una etiqueta corta (ej: transporte, comida, casa, etc.).
-   - "categoria" y "tipo" deben venir del catálogo cuando haya coincidencia.
-
-TEXTO DEL USUARIO:
-"{texto}"
-    """
-
-    # 3) LLAMAR AL MODELO DE OPENAI
-    resp = client_ai.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Eres un asistente que estructura gastos y SIEMPRE "
-                    "respondes solo JSON válido."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
+    response = client_ai.responses.create(
+        model="gpt-5-mini",
+        input=prompt,
     )
 
-    contenido = resp.choices[0].message.content
+    # Extraemos el texto de la respuesta
+    raw = response.output[0].content[0].text
+    texto_modelo = raw.value if hasattr(raw, "value") else str(raw)
 
-    # Reutilizamos tu función extraer_json_desde_texto para limpiar
-    datos = extraer_json_desde_texto(contenido)
-    return datos
+    # Nos quedamos solo con el bloque JSON
+    start = texto_modelo.find("{")
+    end = texto_modelo.rfind("}") + 1
+    if start == -1 or end == 0:
+        raise ValueError(f"No se encontró JSON en la respuesta del modelo: {texto_modelo}")
 
+    json_str = texto_modelo[start:end]
+    data = json.loads(json_str)
 
+    # Normalizamos algunos campos básicos
+    fecha = data.get("fecha", hoy)
+    descripcion = str(data.get("descripcion", "")).strip()
+    monto = float(data.get("monto", 0))
+    metodo_pago = str(data.get("metodo_pago", "")).strip().lower()
+    tarjeta = str(data.get("tarjeta", "")).strip()
+
+    # =========================
+    # COMPLETAR CON CATÁLOGO
+    # =========================
+    desc_norm = descripcion.lower()
+
+    info_cat = CATALOGO_GASTOS.get(desc_norm)
+    if info_cat:
+        concepto = info_cat.get("categoria") or "otros"
+        tipo = info_cat.get("tipo") or "otros"
+    else:
+        # Si no encontramos la descripción en el catálogo,
+        # igual registramos el gasto con valores genéricos.
+        concepto = "otros"
+        tipo = "otros"
+
+    return {
+        "fecha": fecha,
+        "descripcion": descripcion,
+        "monto": monto,
+        "metodo_pago": metodo_pago,
+        "tarjeta": tarjeta,
+        "concepto": concepto,
+        "tipo": tipo,
+    }
+
+# =========================
+# FUNCIÓN: REGISTRAR GASTO
+# =========================
+
+def registrar_gasto(texto_original):
+    """
+    Interpreta el mensaje, escribe una fila en Google Sheets
+    y devuelve el texto de respuesta para WhatsApp.
+    """
+    datos = interpretar_gasto(texto_original)
+
+    fecha = datos["fecha"]
+    descripcion = datos["descripcion"]
+    monto = datos["monto"]
+    metodo_pago = datos["metodo_pago"]
+    tarjeta = datos["tarjeta"]
+    concepto = datos["concepto"]
+    tipo = datos["tipo"]
+
+    # Por si quieres guardar hora exacta y fuente
+    ts_registro = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    origen = "WhatsApp"
+
+    # Ajusta el orden de columnas a como está tu pestaña "Gastos AI"
+    fila = [
+        fecha,
+        descripcion,
+        concepto,
+        tipo,
+        monto,
+        metodo_pago,
+        tarjeta,
+        ts_registro,
+        origen,
+    ]
+
+    sheet_registros.append_row(fila, value_input_option="USER_ENTERED")
+
+    respuesta = (
+        "✅ Gasto registrado:\n"
+        f"• Fecha: {fecha}\n"
+        f"• Descripción: {descripcion}\n"
+        f"• Concepto: {concepto}\n"
+        f"• Tipo: {tipo}\n"
+        f"• Monto: {monto}\n"
+        f"• Método: {metodo_pago}\n"
+        f"• Tarjeta: {tarjeta or '-'}"
+    )
+    return respuesta
+
+# =========================
+# FLASK + TWILIO
+# =========================
+
+app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def health():
@@ -136,35 +244,27 @@ def health():
 
 @app.route("/webhook-whatsapp", methods=["POST"])
 def webhook_whatsapp():
-    """Endpoint que Twilio llamará cada vez que llegue un WhatsApp."""
+    """
+    Endpoint que Twilio llama cada vez que llega un WhatsApp.
+    """
     body = request.form.get("Body", "")
     from_number = request.form.get("From", "")
 
     print(f"Mensaje recibido de {from_number}: {body}")
 
-    try:
-        datos = registrar_gasto_en_sheet(body)
-        resp_text = (
-            "✅ Gasto registrado:\n"
-            f"- Fecha: {datos.get('fecha')}\n"
-            f"- Descripción: {datos.get('descripcion')}\n"
-            f"- Concepto: {datos.get('concepto')}\n"
-            f"- Monto: {datos.get('monto')}\n"
-            f"- Método: {datos.get('metodo_pago')}\n"
-            f"- Tarjeta: {datos.get('tipo_tarjeta')}"
-        )
-    except Exception as e:
-        print("Error procesando gasto:", e)
-        resp_text = (
-            "❌ Ocurrió un error al registrar tu gasto.\n"
-            "Revisa el formato o intenta de nuevo."
-        )
+    resp = MessagingResponse()
 
-    tw_resp = MessagingResponse()
-    tw_resp.message(resp_text)
-    return str(tw_resp)
+    try:
+        texto_respuesta = registrar_gasto(body)
+        resp.message(texto_respuesta)
+    except Exception as e:
+        # Log detallado para que puedas ver el error en Render logs
+        print(f"Error procesando mensaje: {e}")
+        resp.message("❌ Ocurrió un error al registrar tu gasto.\nRevisa el formato o intenta de nuevo.")
+
+    return str(resp)
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
-
+    # Para pruebas locales
+    app.run(host="0.0.0.0", port=5000, debug=True)
