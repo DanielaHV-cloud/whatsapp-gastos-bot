@@ -34,41 +34,42 @@ client_gs = gspread.authorize(creds)
 spreadsheet = client_gs.open(SPREADSHEET_NAME)
 sheet_gastos = spreadsheet.worksheet(HOJA_GASTOS)
 
-# ===================== CARGAR CATÁLOGO =====================
+# ===================== CARGA DEL CATÁLOGO (versión segura) =====================
 
 # Diccionario descripcion_normalizada -> (categoria, tipo)
 catalogo_gastos = {}
 
 def cargar_catalogo():
     """
-    Lee la pestaña CatalogoGastos y construye un diccionario:
-    descripcion (col A) -> (categoria (col B), tipo (col C))
-    Todo en minúsculas y sin espacios extra.
+    Carga la pestaña CatalogoGastos de forma segura.
+    Si falla, NO detiene el servidor y deja el catálogo vacío.
     """
     global catalogo_gastos
+
     try:
         hoja_catalogo = spreadsheet.worksheet(HOJA_CATALOGO)
-        # Suponiendo que hay encabezados en la fila 1
-        filas = hoja_catalogo.get_all_values()[1:]  # salta encabezado
+        filas = hoja_catalogo.get_all_values()
 
         tmp = {}
-        for fila in filas:
-            # Aseguramos longitud mínima
+        for fila in filas[1:]:  # saltar encabezado
             if len(fila) < 3:
                 continue
+
             descripcion = (fila[0] or "").strip().lower()
             categoria = (fila[1] or "").strip()
             tipo = (fila[2] or "").strip()
+
             if descripcion:
                 tmp[descripcion] = (categoria, tipo)
 
         catalogo_gastos = tmp
         print(f"[CATALOGO] Se cargaron {len(catalogo_gastos)} registros.")
-    except Exception as e:
-        # Si algo falla, dejamos el catálogo vacío pero NO rompemos la app
-        catalogo_gastos = {}
-        print(f"[CATALOGO] Error al cargar catálogo: {e}")
 
+    except Exception as e:
+        catalogo_gastos = {}
+        print(f"[CATALOGO] Error al cargar CatalogoGastos: {e}")
+
+# Ejecutar carga de catálogo al iniciar el servidor
 cargar_catalogo()
 
 # ===================== LÓGICA DE IA =====================
