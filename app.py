@@ -45,33 +45,68 @@ def extraer_json_desde_texto(texto: str) -> dict:
 
 
 def interpretar_gasto(texto: str) -> dict:
-    """Llama a OpenAI para convertir texto libre en un JSON de gasto."""
+    """
+    Llama a OpenAI para convertir texto libre en un JSON de gasto,
+    usando el catálogo de la pestaña 'CatalogoGastos'.
+    """
+
     hoy = datetime.now().strftime("%Y-%m-%d")
 
+    # 1) LEER EL CATALOGO DESDE GOOGLE SHEETS
+    #    Pestaña: CatalogoGastos, columnas:
+    #    A: descripcion_base, B: categoria, C: tipo
+    sheet_catalogo = spreadsheet.worksheet("CatalogoGastos")
+    catalogo_data = sheet_catalogo.get_all_values()[1:]  # omitimos la fila de encabezados
+
+    catalogo_lineas = []
+    for fila in catalogo_data:
+        if len(fila) >= 3 and fila[0].strip():
+            desc = fila[0].strip()
+            categoria = fila[1].strip()
+            tipo = fila[2].strip()
+            catalogo_lineas.append(f"- {desc} -> categoria={categoria}, tipo={tipo}")
+
+    if catalogo_lineas:
+        catalogo_texto = "\n".join(catalogo_lineas)
+    else:
+        catalogo_texto = "(no hay filas en el catálogo)"
+
+    # 2) ARMAR EL PROMPT PARA LA IA
     prompt = f"""
-Devuelve SOLO un JSON válido con estas llaves:
-fecha, descripcion, concepto, monto, metodo_pago, tipo_tarjeta.
+Eres un asistente que interpreta gastos personales y los clasifica
+usando un CATALOGO OFICIAL.
 
-Reglas:
-- Si no hay fecha, usa {hoy}.
-- Si dice "ayer", ajusta la fecha.
-- Método de pago: efectivo, tarjeta, transferencia u otro.
-- Conceptos: comida, transporte, casa, salud, entretenimiento, otros.
+CATÁLOGO OFICIAL (usa la opción más parecida):
+{catalogo_texto}
 
-Ejemplo:
-{{
-  "fecha": "2025-11-22",
-  "descripcion": "uber",
-  "concepto": "transporte",
-  "monto": 230,
-  "metodo_pago": "tarjeta",
-  "tipo_tarjeta": "NU"
-}}
+INSTRUCCIONES:
 
-Texto del usuario:
+1. A partir del texto del usuario, identifica:
+   - fecha
+   - descripcion (como la escriba la persona, limpio)
+   - monto (solo número, sin símbolo)
+   - metodo_pago (uno de: efectivo, tarjeta, transferencia, otro)
+   - tipo_tarjeta (ej: BBVA, NU, HSBC, AMEX, etc. o null si no aplica)
+
+2. Para CLASIFICAR:
+   - Compara la descripcion del gasto con las "descripcion_base" del catálogo.
+   - Elige la más parecida.
+   - Usa EXACTAMENTE la categoria y tipo que aparezcan en el catálogo.
+   - Si no encuentras nada razonable, usa:
+     categoria = "Otros"
+     tipo = "Otros"
+
+3. Devuelve SOLO un JSON VÁLIDO con estas claves:
+   fecha, descripcion, concepto, categoria, tipo, monto, metodo_pago, tipo_tarjeta
+
+   - "concepto" puede ser una etiqueta corta (ej: transporte, comida, casa, etc.).
+   - "categoria" y "tipo" deben venir del catálogo cuando haya coincidencia.
+
+TEXTO DEL USUARIO:
 "{texto}"
-"""
+    """
 
+    # 3) LLAMAR AL MODELO DE OPENAI
     resp = client_ai.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -87,27 +122,11 @@ Texto del usuario:
     )
 
     contenido = resp.choices[0].message.content
+
+    # Reutilizamos tu función extraer_json_desde_texto para limpiar
     datos = extraer_json_desde_texto(contenido)
     return datos
 
-
-def registrar_gasto_en_sheet(texto_usuario: str) -> dict:
-    """Interpreta el gasto y lo guarda en Google Sheets."""
-    datos = interpretar_gasto(texto_usuario)
-
-    sheet.append_row(
-        [
-            datos.get("fecha"),
-            datos.get("descripcion"),
-            datos.get("concepto"),
-            datos.get("monto"),
-            datos.get("metodo_pago"),
-            datos.get("tipo_tarjeta"),
-            "whatsapp_bot",
-        ]
-    )
-
-    return datos
 
 
 @app.route("/", methods=["GET"])
