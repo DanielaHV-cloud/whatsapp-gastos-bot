@@ -2,238 +2,173 @@ import os
 import json
 from datetime import datetime
 
-from flask import Flask, request
+from flask import Flask, request, Response
+from openai import OpenAI
 from twilio.twiml.messaging_response import MessagingResponse
 
 import gspread
 from google.oauth2.service_account import Credentials
 
-from openai import OpenAI
-
-# =========================
-# CONFIGURACIÓN INICIAL
-# =========================
+# ===================== CONFIGURACIONES =====================
 
 # OpenAI
-client_ai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client_ai = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # Google Sheets
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/drive"
 ]
 
-# En Render subimos el secret file como `service_account.json`
-SERVICE_ACCOUNT_FILE = os.getenv(
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "/etc/secrets/service_account.json"
-)
-
-creds = Credentials.from_service_account_file(
-    SERVICE_ACCOUNT_FILE,
-    scopes=SCOPES
-)
-gc = gspread.authorize(creds)
+CREDS_FILE = "service_account.json"  # nombre del archivo que subimos a Render
 
 SPREADSHEET_NAME = "Financial Planner ADHV"
-SHEET_REGISTROS = "Gastos AI"
-SHEET_CATALOGO = "CatalogoGastos"
+HOJA_GASTOS = "Gastos AI"
+HOJA_CATALOGO = "CatalogoGastos"
 
-sh = gc.open(SPREADSHEET_NAME)
-sheet_registros = sh.worksheet(SHEET_REGISTROS)
-sheet_catalogo = sh.worksheet(SHEET_CATALOGO)
+creds = Credentials.from_service_account_file(
+    CREDS_FILE,
+    scopes=SCOPES
+)
+client_gs = gspread.authorize(creds)
+spreadsheet = client_gs.open(SPREADSHEET_NAME)
+sheet_gastos = spreadsheet.worksheet(HOJA_GASTOS)
 
-# =========================
-# CARGAR CATÁLOGO DE GASTOS
-# =========================
+# ===================== CARGAR CATÁLOGO =====================
 
-def cargar_catalogo_desde_sheet():
+# Diccionario descripcion_normalizada -> (categoria, tipo)
+catalogo_gastos = {}
+
+def cargar_catalogo():
     """
-    Lee CatalogoGastos y arma un dict:
-    {
-        "luz": {"categoria": "...", "tipo": "..."},
-        "uber": {"categoria": "...", "tipo": "..."},
-        ...
-    }
-    Normalizamos descripción a minúsculas, sin espacios alrededor.
+    Lee la pestaña CatalogoGastos y construye un diccionario:
+    descripcion (col A) -> (categoria (col B), tipo (col C))
+    Todo en minúsculas y sin espacios extra.
     """
-    registros = sheet_catalogo.get_all_records()
-    catalogo = {}
+    global catalogo_gastos
+    try:
+        hoja_catalogo = spreadsheet.worksheet(HOJA_CATALOGO)
+        # Suponiendo que hay encabezados en la fila 1
+        filas = hoja_catalogo.get_all_values()[1:]  # salta encabezado
 
-    for fila in registros:
-        # Tratamos de admitir varias variantes de nombres de columna
-        desc = (
-            fila.get("descripcion")
-            or fila.get("Descripción")
-            or fila.get("DESCRIPCION")
-            or fila.get("DESCRIPCIÓN")
-            or fila.get("Description")
-            or ""
-        )
-        categoria = (
-            fila.get("categoria")
-            or fila.get("Categoría")
-            or fila.get("CATEGORIA")
-            or ""
-        )
-        tipo = (
-            fila.get("tipo")
-            or fila.get("Tipo")
-            or fila.get("TIPO")
-            or ""
-        )
+        tmp = {}
+        for fila in filas:
+            # Aseguramos longitud mínima
+            if len(fila) < 3:
+                continue
+            descripcion = (fila[0] or "").strip().lower()
+            categoria = (fila[1] or "").strip()
+            tipo = (fila[2] or "").strip()
+            if descripcion:
+                tmp[descripcion] = (categoria, tipo)
 
-        desc_norm = str(desc).strip().lower()
-        if desc_norm:
-            catalogo[desc_norm] = {
-                "categoria": str(categoria).strip(),
-                "tipo": str(tipo).strip(),
-            }
+        catalogo_gastos = tmp
+        print(f"[CATALOGO] Se cargaron {len(catalogo_gastos)} registros.")
+    except Exception as e:
+        # Si algo falla, dejamos el catálogo vacío pero NO rompemos la app
+        catalogo_gastos = {}
+        print(f"[CATALOGO] Error al cargar catálogo: {e}")
 
-    return catalogo
+cargar_catalogo()
 
-
-CATALOGO_GASTOS = cargar_catalogo_desde_sheet()
-
-# =========================
-# FUNCIÓN: INTERPRETAR GASTO
-# =========================
+# ===================== LÓGICA DE IA =====================
 
 def interpretar_gasto(texto):
     """
-    Llama a OpenAI para transformar el mensaje en un JSON con:
-    fecha, descripcion, monto, metodo_pago, tarjeta.
-
-    Luego completa concepto y tipo usando el catálogo.
+    Usa OpenAI para extraer la información del gasto a partir del texto libre.
+    1) Pide a OpenAI una estructura JSON básica (fecha, descripción, monto, método, tarjeta).
+    2) Con la descripción, busca en el catálogo la categoría y el tipo.
     """
-    hoy = datetime.now().strftime("%Y-%m-%d")
 
     prompt = f"""
-Eres un asistente que extrae información de gastos a partir de mensajes en español.
+Eres un asistente que extrae información de gastos personales desde un mensaje en español.
 
-Del siguiente texto de entrada, identifica:
-- fecha del gasto (si no se menciona, usa la fecha de hoy: {hoy})
-- descripción del gasto (por ejemplo: "uber", "luz", "super", "gasolina")
-- monto en pesos mexicanos
-- método de pago (efectivo, tarjeta, transferencia, etc.)
-- tarjeta o banco si se menciona (por ejemplo: BBVA, AMEX, Banorte)
-
-Devuelve SOLO un JSON válido con esta estructura (sin texto extra):
-
+Devuelve UNICAMENTE un JSON válido con esta estructura:
 {{
   "fecha": "YYYY-MM-DD",
   "descripcion": "texto corto",
-  "monto": 123.45,
-  "metodo_pago": "tarjeta | efectivo | transferencia | otro",
-  "tarjeta": "nombre de banco/tarjeta o vacío si no se menciona"
+  "monto": 0,
+  "metodo": "efectivo|tarjeta",
+  "tarjeta": "nombre o vacío"
 }}
 
-Texto de entrada:
+Reglas:
+- Si el usuario dice una fecha como "el 22 de noviembre", conviértela a formato YYYY-MM-DD (año actual).
+- "metodo" solo puede ser "efectivo" o "tarjeta".
+- Si no menciona tarjeta, deja "tarjeta" como cadena vacía "".
+- "monto" es numérico (sin símbolo de moneda).
+- Usa el año actual si no se especifica.
+
+Mensaje del usuario:
 \"\"\"{texto}\"\"\""""
 
     response = client_ai.responses.create(
         model="gpt-5-mini",
-        input=prompt,
+        input=prompt
     )
 
-    # Extraemos el texto de la respuesta
     raw = response.output[0].content[0].text
-    texto_modelo = raw.value if hasattr(raw, "value") else str(raw)
+    # Intentar localizar JSON dentro del texto devuelto
+    json_str = raw
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1:
+        json_str = raw[start:end+1]
 
-    # Nos quedamos solo con el bloque JSON
-    start = texto_modelo.find("{")
-    end = texto_modelo.rfind("}") + 1
-    if start == -1 or end == 0:
-        raise ValueError(f"No se encontró JSON en la respuesta del modelo: {texto_modelo}")
-
-    json_str = texto_modelo[start:end]
     data = json.loads(json_str)
 
-    # Normalizamos algunos campos básicos
-    fecha = data.get("fecha", hoy)
-    descripcion = str(data.get("descripcion", "")).strip()
-    monto = float(data.get("monto", 0))
-    metodo_pago = str(data.get("metodo_pago", "")).strip().lower()
-    tarjeta = str(data.get("tarjeta", "")).strip()
+    # Normalizar fecha (si viene vacía o mal, usar hoy)
+    try:
+        if data.get("fecha"):
+            _ = datetime.fromisoformat(data["fecha"])
+        else:
+            raise ValueError("Fecha vacía")
+    except Exception:
+        hoy = datetime.now().date().isoformat()
+        data["fecha"] = hoy
 
-    # =========================
-    # COMPLETAR CON CATÁLOGO
-    # =========================
-    desc_norm = descripcion.lower()
+    # Aseguramos campos básicos
+    data["descripcion"] = data.get("descripcion", "").strip()
+    data["metodo"] = (data.get("metodo") or "").strip().lower() or "tarjeta"
+    data["tarjeta"] = data.get("tarjeta", "").strip()
+    data["monto"] = float(data.get("monto", 0))
 
-    info_cat = CATALOGO_GASTOS.get(desc_norm)
-    if info_cat:
-        concepto = info_cat.get("categoria") or "otros"
-        tipo = info_cat.get("tipo") or "otros"
-    else:
-        # Si no encontramos la descripción en el catálogo,
-        # igual registramos el gasto con valores genéricos.
-        concepto = "otros"
-        tipo = "otros"
+    # ================= CATEGORÍA Y TIPO DESDE CATÁLOGO =================
+    desc_norm = data["descripcion"].lower().strip()
+    categoria = "otros"
+    tipo = "otros"
 
-    return {
-        "fecha": fecha,
-        "descripcion": descripcion,
-        "monto": monto,
-        "metodo_pago": metodo_pago,
-        "tarjeta": tarjeta,
-        "concepto": concepto,
-        "tipo": tipo,
-    }
+    if desc_norm in catalogo_gastos:
+        categoria, tipo = catalogo_gastos[desc_norm]
 
-# =========================
-# FUNCIÓN: REGISTRAR GASTO
-# =========================
+    data["categoria"] = categoria
+    data["tipo"] = tipo
 
-def registrar_gasto(texto_original):
+    return data
+
+def registrar_gasto(texto):
     """
-    Interpreta el mensaje, escribe una fila en Google Sheets
-    y devuelve el texto de respuesta para WhatsApp.
+    Llama a OpenAI para interpretar el gasto,
+    luego lo registra en la pestaña 'Gastos AI' de Google Sheets.
     """
-    datos = interpretar_gasto(texto_original)
 
-    fecha = datos["fecha"]
-    descripcion = datos["descripcion"]
-    monto = datos["monto"]
-    metodo_pago = datos["metodo_pago"]
-    tarjeta = datos["tarjeta"]
-    concepto = datos["concepto"]
-    tipo = datos["tipo"]
+    data = interpretar_gasto(texto)
 
-    # Por si quieres guardar hora exacta y fuente
-    ts_registro = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    origen = "WhatsApp"
-
-    # Ajusta el orden de columnas a como está tu pestaña "Gastos AI"
+    # Row example (ajusta al orden real de columnas de tu hoja 'Gastos AI')
     fila = [
-        fecha,
-        descripcion,
-        concepto,
-        tipo,
-        monto,
-        metodo_pago,
-        tarjeta,
-        ts_registro,
-        origen,
+        data["fecha"],
+        data["descripcion"],
+        data["categoria"],
+        data["tipo"],
+        data["monto"],
+        data["metodo"],
+        data["tarjeta"]
     ]
 
-    sheet_registros.append_row(fila, value_input_option="USER_ENTERED")
+    sheet_gastos.append_row(fila, value_input_option="USER_ENTERED")
+    return data
 
-    respuesta = (
-        "✅ Gasto registrado:\n"
-        f"• Fecha: {fecha}\n"
-        f"• Descripción: {descripcion}\n"
-        f"• Concepto: {concepto}\n"
-        f"• Tipo: {tipo}\n"
-        f"• Monto: {monto}\n"
-        f"• Método: {metodo_pago}\n"
-        f"• Tarjeta: {tarjeta or '-'}"
-    )
-    return respuesta
-
-# =========================
-# FLASK + TWILIO
-# =========================
+# ===================== FLASK APP =====================
 
 app = Flask(__name__)
 
@@ -241,30 +176,44 @@ app = Flask(__name__)
 def health():
     return "Bot de gastos WhatsApp OK", 200
 
-
 @app.route("/webhook-whatsapp", methods=["POST"])
 def webhook_whatsapp():
-    """
-    Endpoint que Twilio llama cada vez que llega un WhatsApp.
-    """
-    body = request.form.get("Body", "")
-    from_number = request.form.get("From", "")
-
-    print(f"Mensaje recibido de {from_number}: {body}")
-
+    """Endpoint que Twilio llamará cada vez que llegue un WhatsApp."""
     resp = MessagingResponse()
 
     try:
-        texto_respuesta = registrar_gasto(body)
-        resp.message(texto_respuesta)
+        body = request.form.get("Body", "")
+        from_number = request.form.get("From", "")
+
+        print(f"[WHATSAPP] Mensaje recibido de {from_number}: {body}")
+
+        if not body.strip():
+            resp.message(
+                "❌ No entendí el mensaje. Envía algo como:\n"
+                "'Gasté 250 en Uber con tarjeta BBVA'."
+            )
+            return Response(str(resp), mimetype="application/xml")
+
+        datos_gasto = registrar_gasto(body)
+
+        msg = (
+            "✅ Gasto registrado:\n"
+            f"• Fecha: {datos_gasto['fecha']}\n"
+            f"• Descripción: {datos_gasto['descripcion']}\n"
+            f"• Concepto: {datos_gasto['categoria']}\n"
+            f"• Tipo: {datos_gasto['tipo']}\n"
+            f"• Monto: {datos_gasto['monto']}\n"
+            f"• Método: {datos_gasto['metodo']}\n"
+            f"• Tarjeta: {datos_gasto['tarjeta'] or 'N/A'}"
+        )
+        resp.message(msg)
+
     except Exception as e:
-        # Log detallado para que puedas ver el error en Render logs
-        print(f"Error procesando mensaje: {e}")
-        resp.message("❌ Ocurrió un error al registrar tu gasto.\nRevisa el formato o intenta de nuevo.")
+        # Log para que lo veas en Render
+        print(f"[ERROR WEBHOOK] {e}")
+        resp.message(
+            "❌ Ocurrió un error al registrar tu gasto.\n"
+            "Revisa el formato o intenta de nuevo."
+        )
 
-    return str(resp)
-
-
-if __name__ == "__main__":
-    # Para pruebas locales
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    return Response(str(resp), mimetype="application/xml")
