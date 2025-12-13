@@ -1,6 +1,7 @@
 import os
 import json
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 
 from flask import Flask, request, Response
 from openai import OpenAI
@@ -8,6 +9,7 @@ from twilio.twiml.messaging_response import MessagingResponse
 
 import gspread
 from google.oauth2.service_account import Credentials
+
 
 # ===================== CONFIGURACIONES =====================
 
@@ -20,13 +22,18 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-CREDS_FILE = "service_account.json"  # nombre del archivo que subimos a Render
+CREDS_FILE = "service_account.json"  # debe existir en el proyecto en Render
 
 SPREADSHEET_NAME = "Financial Planner ADHV"
 HOJA_GASTOS = "Gastos AI"
 HOJA_CATALOGO = "CatalogoGastos"
 
-# Conexión a Google Sheets
+# ===================== APP =====================
+
+app = Flask(__name__)
+
+# ===================== GOOGLE SHEETS INIT =====================
+
 try:
     creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
     client_gs = gspread.authorize(creds)
@@ -34,39 +41,53 @@ try:
     sheet_gastos = spreadsheet.worksheet(HOJA_GASTOS)
     print("[INIT] Conexión con Google Sheets OK")
 except Exception as e:
-    print("[INIT ERROR] Google Sheets:", e)
-    raise
+    print(f"[INIT ERROR] No se pudo conectar a Google Sheets: {e}")
+    spreadsheet = None
+    sheet_gastos = None
+
 
 # ===================== CARGAR CATÁLOGO =====================
 
-# Diccionario descripcion_normalizada -> (categoria, tipo)
-catalogo_gastos = {}
+catalogo_gastos = {}  # desc_norm -> (categoria, tipo)
 
+def normalizar_desc(s: str) -> str:
+    # lower + colapsa espacios
+    return " ".join((s or "").lower().split())
 
 def cargar_catalogo():
     """
-    Lee la pestaña CatalogoGastos y construye un diccionario:
+    Lee la pestaña CatalogoGastos y construye:
       descripcion_base (col A) -> (categoria (col B), tipo (col C))
-    Todo en minúsculas y sin espacios extra.
     """
     global catalogo_gastos
+
+    if spreadsheet is None:
+        print("[CATALOGO] No hay conexión a spreadsheet.")
+        catalogo_gastos = {}
+        return
+
     try:
         hoja_catalogo = spreadsheet.worksheet(HOJA_CATALOGO)
-        filas = hoja_catalogo.get_all_values()[1:]  # salta encabezado
+        filas = hoja_catalogo.get_all_values()
+
+        # Si hay encabezados, los saltamos si detectamos texto típico
+        # (igual si no hay headers, no pasa nada grave)
+        if filas and len(filas) > 0:
+            header = [c.lower() for c in filas[0]]
+            if "descripcion" in " ".join(header) or "descripcion_base" in " ".join(header):
+                filas = filas[1:]
 
         tmp = {}
         for fila in filas:
             if len(fila) < 3:
                 continue
 
-            descripcion = (fila[0] or "").strip().lower()
-            categoria = (fila[1] or "").strip()
+            desc = normalizar_desc(fila[0])
+            cat = (fila[1] or "").strip()
             tipo = (fila[2] or "").strip()
 
-            if descripcion:
-                # Normalizamos espacios internos
-                desc_norm = " ".join(descripcion.split())
-                tmp[desc_norm] = (categoria, tipo)
+            if desc:
+                tmp[desc] = (cat, tipo)
 
         catalogo_gastos = tmp
         print(f"[CATALOGO] Se cargaron {len(catalogo_gastos)} registros.")
@@ -74,109 +95,153 @@ def cargar_catalogo():
         catalogo_gastos = {}
         print(f"[CATALOGO] Error al cargar catálogo: {e}")
 
-
+# Cargar al iniciar
 cargar_catalogo()
+
+
+# ===================== FECHA: DETECCIÓN & CÁLCULO =====================
+
+MESES_ES = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "setiembre", "octubre", "noviembre", "diciembre"
+]
+
+def texto_menciona_fecha(texto: str) -> bool:
+    t = (texto or "").lower()
+
+    # Mes en texto
+    if any(m in t for m in MESES_ES):
+        return True
+
+    # 2025-12-13
+    if re.search(r"\b\d{4}-\d{1,2}-\d{1,2}\b", t):
+        return True
+
+    # 13/12/2025, 13-12, etc.
+    if re.search(r"\b\d{1,2}[/-]\d{1,2}([/-]\d{2,4})?\b", t):
+        return True
+
+    # palabras tipo fecha
+    if re.search(r"\b(hoy|ayer|antier|antes de ayer|mañana|pasado mañana)\b", t):
+        return True
+
+    return False
+
+
+def fecha_relativa_si_aplica(texto: str) -> str | None:
+    """
+    Si el texto dice hoy/ayer/antier/mañana/pasado mañana
+    devolvemos YYYY-MM-DD calculado en Python.
+    Si no aplica, None.
+    """
+    t = (texto or "").lower()
+    today = datetime.now().date()
+
+    # Nota: "antier" (MX) == hoy - 2
+    if "antes de ayer" in t or "antier" in t:
+        return (today - timedelta(days=2)).isoformat()
+    if "ayer" in t:
+        return (today - timedelta(days=1)).isoformat()
+    if "pasado mañana" in t:
+        return (today + timedelta(days=2)).isoformat()
+    if "mañana" in t:
+        return (today + timedelta(days=1)).isoformat()
+    if "hoy" in t:
+        return today.isoformat()
+
+    return None
+
 
 # ===================== LÓGICA DE IA =====================
 
-
-def interpretar_gasto(texto):
+def interpretar_gasto(texto: str) -> dict:
     """
-    Usa OpenAI para extraer la información del gasto a partir del texto libre.
-    1) Pide a OpenAI una estructura JSON básica (fecha, descripción, monto, método, tarjeta).
-    2) Con la descripción, busca en el catálogo la categoría y el tipo.
+    1) Pide JSON base a OpenAI.
+    2) Aplica regla fuerte: si NO hay fecha en el texto -> HOY.
+    3) Categoría y tipo vienen del catálogo por descripción.
     """
 
-    system_msg = """
+    prompt = f"""
 Eres un asistente que extrae información de gastos personales desde un mensaje en español.
 
-Debes devolver EXCLUSIVAMENTE un JSON válido con esta estructura exacta:
-{
-  "fecha": "YYYY-MM-DD",
+Devuelve ÚNICAMENTE un JSON válido con esta estructura:
+{{
+  "fecha": "YYYY-MM-DD o vacío",
   "descripcion": "texto corto",
   "monto": 0,
   "metodo": "efectivo|tarjeta",
   "tarjeta": "nombre o vacío"
-}
+}}
 
-Reglas:
-- Si el usuario dice una fecha como "el 22 de noviembre", conviértela a formato YYYY-MM-DD (año actual).
+Reglas IMPORTANTES:
+- SOLO llena "fecha" si el usuario menciona explícitamente una fecha (ej. "el 22 de noviembre", "13/12/2025", "hoy", "ayer").
+- Si el usuario NO menciona fecha, devuelve: "fecha": "" (cadena vacía).
 - "metodo" solo puede ser "efectivo" o "tarjeta".
-- Si no menciona tarjeta, deja "tarjeta" como cadena vacía "".
+- Si no menciona tarjeta, deja "tarjeta" como "".
 - "monto" es numérico (sin símbolo de moneda).
-- Usa el año actual si no se especifica.
-- NO agregues texto adicional fuera del JSON.
+
+Mensaje del usuario:
+\"\"\"{texto}\"\"\"
 """
 
-    user_msg = f"Mensaje del usuario:\n\"\"\"{texto}\"\"\""
+    response = client_ai.responses.create(
+        model="gpt-5-mini",
+        input=prompt
+    )
 
-    # ---------- Llamada a OpenAI con chat.completions ----------
+    # lectura defensiva
+    raw = ""
     try:
-        resp = client_ai.chat.completions.create(
-            model="gpt-4o-mini",  # si quieres puedes volver a gpt-5-mini
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0,
-        )
+        raw = response.output_text
+    except Exception:
+        raw = response.output[0].content[0].text
 
-        raw = resp.choices[0].message.content
-        print("[OPENAI RAW]", raw)
-    except Exception as e:
-        print("[OPENAI ERROR]", repr(e))
-        raise
-
-    if not raw:
-        raise ValueError("Respuesta vacía de OpenAI")
-
-    # ---------- Extraer el JSON del texto ----------
+    # extraer json
     start = raw.find("{")
     end = raw.rfind("}")
-    if start == -1 or end == -1:
-        print("[JSON ERROR] No se encontró JSON en la respuesta:", raw)
-        raise ValueError("No se encontró JSON en la respuesta de OpenAI")
+    if start != -1 and end != -1:
+        raw = raw[start:end + 1]
 
-    json_str = raw[start : end + 1]
+    data = json.loads(raw)
 
-    try:
-        data = json.loads(json_str)
-    except Exception as e:
-        print("[JSON ERROR] No se pudo parsear el JSON:", e, "| RAW:", raw)
-        raise
-
-    # ---------- Normalizar campos ----------
-    # Fecha
-    try:
-        if data.get("fecha"):
-            _ = datetime.fromisoformat(data["fecha"])
-        else:
-            raise ValueError("Fecha vacía")
-    except Exception:
-        hoy = datetime.now().date().isoformat()
-        data["fecha"] = hoy
-
-    # Descripción, método, tarjeta, monto
-    data["descripcion"] = data.get("descripcion", "").strip()
+    # normalizar campos base
+    data["descripcion"] = (data.get("descripcion") or "").strip()
     data["metodo"] = (data.get("metodo") or "").strip().lower() or "tarjeta"
-    data["tarjeta"] = data.get("tarjeta", "").strip()
+    data["tarjeta"] = (data.get("tarjeta") or "").strip()
+    data["monto"] = float(data.get("monto") or 0)
 
-    try:
-        data["monto"] = float(str(data.get("monto", 0)).replace(",", "."))
-    except Exception:
-        data["monto"] = 0.0
+    # --------- FECHA: regla fuerte ----------
+    hoy = datetime.now().date().isoformat()
 
-    # ---------- CATEGORÍA Y TIPO DESDE CATÁLOGO ----------
-    desc_norm = " ".join(data["descripcion"].lower().split())
+    # Si el texto NO menciona fecha, forzamos hoy
+    if not texto_menciona_fecha(texto):
+        data["fecha"] = hoy
+    else:
+        # Si menciona hoy/ayer/etc, mejor calcularlo en Python
+        rel = fecha_relativa_si_aplica(texto)
+        if rel:
+            data["fecha"] = rel
+        else:
+            # si el modelo dio fecha rara o vacía, caemos a hoy
+            try:
+                if data.get("fecha"):
+                    _ = datetime.fromisoformat(data["fecha"])
+                else:
+                    data["fecha"] = hoy
+            except Exception:
+                data["fecha"] = hoy
+
+    # --------- CATEGORÍA & TIPO (catálogo) ----------
+    desc_norm = normalizar_desc(data["descripcion"])
     categoria = "otros"
     tipo = "otros"
 
     if desc_norm in catalogo_gastos:
-        cat_catalogo, tipo_catalogo = catalogo_gastos[desc_norm]
-        if cat_catalogo:
-            categoria = cat_catalogo
-        if tipo_catalogo:
-            tipo = tipo_catalogo
+        cat, tp = catalogo_gastos[desc_norm]
+        if cat:
+            categoria = cat
+        if tp:
+            tipo = tp
 
     data["categoria"] = categoria
     data["tipo"] = tipo
@@ -184,14 +249,16 @@ Reglas:
     return data
 
 
-def registrar_gasto(texto):
+def registrar_gasto(texto: str) -> dict:
     """
-    Llama a OpenAI para interpretar el gasto,
-    luego lo registra en la pestaña 'Gastos AI' de Google Sheets.
+    Interpreta y guarda en la hoja "Gastos AI"
     """
+    if sheet_gastos is None:
+        raise RuntimeError("No hay conexión a Google Sheets (sheet_gastos = None).")
 
     data = interpretar_gasto(texto)
 
+    # Ajusta el orden según tu hoja "Gastos AI"
     fila = [
         data["fecha"],
         data["descripcion"],
@@ -206,10 +273,7 @@ def registrar_gasto(texto):
     return data
 
 
-# ===================== FLASK APP =====================
-
-app = Flask(__name__)
-
+# ===================== ENDPOINTS =====================
 
 @app.route("/", methods=["GET"])
 def health():
@@ -218,7 +282,6 @@ def health():
 
 @app.route("/webhook-whatsapp", methods=["POST"])
 def webhook_whatsapp():
-    """Endpoint que Twilio llamará cada vez que llegue un WhatsApp."""
     resp = MessagingResponse()
 
     try:
@@ -229,8 +292,10 @@ def webhook_whatsapp():
 
         if not body.strip():
             resp.message(
-                "❌ No entendí el mensaje. Envía algo como:\n"
-                "'Gasté 250 en Uber con tarjeta BBVA'."
+                "❌ No entendí el mensaje. Ejemplos:\n"
+                "- Gasté 250 en Uber con tarjeta BBVA\n"
+                "- Ayer gasté 500 en Walmart con tarjeta AMEX\n"
+                "- El 13 de diciembre 2025 gasté 300 en luz con tarjeta BBVA"
             )
             return Response(str(resp), mimetype="application/xml")
 
