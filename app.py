@@ -13,10 +13,8 @@ from google.oauth2.service_account import Credentials
 
 # ===================== CONFIGURACIONES =====================
 
-# OpenAI
 client_ai = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-# Google Sheets
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -28,9 +26,8 @@ SPREADSHEET_NAME = "Financial Planner ADHV"
 HOJA_GASTOS = "Gastos AI"
 HOJA_CATALOGO = "CatalogoGastos"
 
-# ===================== APP =====================
-
 app = Flask(__name__)
+
 
 # ===================== GOOGLE SHEETS INIT =====================
 
@@ -46,19 +43,14 @@ except Exception as e:
     sheet_gastos = None
 
 
-# ===================== CARGAR CATÁLOGO =====================
+# ===================== CATÁLOGO =====================
 
 catalogo_gastos = {}  # desc_norm -> (categoria, tipo)
 
 def normalizar_desc(s: str) -> str:
-    # lower + colapsa espacios
     return " ".join((s or "").lower().split())
 
 def cargar_catalogo():
-    """
-    Lee la pestaña CatalogoGastos y construye:
-      descripcion_base (col A) -> (categoria (col B), tipo (col C))
-    """
     global catalogo_gastos
 
     if spreadsheet is None:
@@ -70,22 +62,19 @@ def cargar_catalogo():
         hoja_catalogo = spreadsheet.worksheet(HOJA_CATALOGO)
         filas = hoja_catalogo.get_all_values()
 
-        # Si hay encabezados, los saltamos si detectamos texto típico
-        # (igual si no hay headers, no pasa nada grave)
+        # Saltar encabezado si parece encabezado
         if filas and len(filas) > 0:
-            header = [c.lower() for c in filas[0]]
-            if "descripcion" in " ".join(header) or "descripcion_base" in " ".join(header):
+            header = " ".join([c.lower() for c in filas[0]])
+            if "descripcion" in header or "descripcion_base" in header:
                 filas = filas[1:]
 
         tmp = {}
         for fila in filas:
             if len(fila) < 3:
                 continue
-
             desc = normalizar_desc(fila[0])
             cat = (fila[1] or "").strip()
             tipo = (fila[2] or "").strip()
-
             if desc:
                 tmp[desc] = (cat, tipo)
 
@@ -95,7 +84,6 @@ def cargar_catalogo():
         catalogo_gastos = {}
         print(f"[CATALOGO] Error al cargar catálogo: {e}")
 
-# Cargar al iniciar
 cargar_catalogo()
 
 
@@ -109,19 +97,15 @@ MESES_ES = [
 def texto_menciona_fecha(texto: str) -> bool:
     t = (texto or "").lower()
 
-    # Mes en texto
     if any(m in t for m in MESES_ES):
         return True
 
-    # 2025-12-13
     if re.search(r"\b\d{4}-\d{1,2}-\d{1,2}\b", t):
         return True
 
-    # 13/12/2025, 13-12, etc.
     if re.search(r"\b\d{1,2}[/-]\d{1,2}([/-]\d{2,4})?\b", t):
         return True
 
-    # palabras tipo fecha
     if re.search(r"\b(hoy|ayer|antier|antes de ayer|mañana|pasado mañana)\b", t):
         return True
 
@@ -129,15 +113,9 @@ def texto_menciona_fecha(texto: str) -> bool:
 
 
 def fecha_relativa_si_aplica(texto: str) -> str | None:
-    """
-    Si el texto dice hoy/ayer/antier/mañana/pasado mañana
-    devolvemos YYYY-MM-DD calculado en Python.
-    Si no aplica, None.
-    """
     t = (texto or "").lower()
     today = datetime.now().date()
 
-    # Nota: "antier" (MX) == hoy - 2
     if "antes de ayer" in t or "antier" in t:
         return (today - timedelta(days=2)).isoformat()
     if "ayer" in t:
@@ -152,22 +130,59 @@ def fecha_relativa_si_aplica(texto: str) -> str | None:
     return None
 
 
+# ===================== LIMPIEZA DE DESCRIPCIÓN =====================
+
+def limpiar_descripcion(desc: str) -> str:
+    """
+    Convierte cosas como:
+      "Compra en Walmart" -> "Walmart"
+      "Pago a Telcel" -> "Telcel"
+    y quita palabras extra antes de buscar en catálogo.
+    """
+    d = normalizar_desc(desc)
+
+    prefijos = [
+        "compra en ",
+        "gasto en ",
+        "pago en ",
+        "pago a ",
+        "pagué en ",
+        "pague en ",
+        "servicio de ",
+        "servicio ",
+        "suscripción a ",
+        "suscripcion a ",
+        "recarga ",
+        "recarga a ",
+    ]
+
+    for pref in prefijos:
+        if d.startswith(pref):
+            d = d[len(pref):].strip()
+
+    # también si viene tipo "en walmart"
+    if d.startswith("en "):
+        d = d[3:].strip()
+
+    # quitar artículos muy comunes al inicio
+    for pref in ["el ", "la ", "los ", "las ", "un ", "una "]:
+        if d.startswith(pref):
+            d = d[len(pref):].strip()
+
+    # Regresar en "Title Case" (opcional)
+    return " ".join([w.capitalize() for w in d.split()])
+
+
 # ===================== LÓGICA DE IA =====================
 
 def interpretar_gasto(texto: str) -> dict:
-    """
-    1) Pide JSON base a OpenAI.
-    2) Aplica regla fuerte: si NO hay fecha en el texto -> HOY.
-    3) Categoría y tipo vienen del catálogo por descripción.
-    """
-
     prompt = f"""
 Eres un asistente que extrae información de gastos personales desde un mensaje en español.
 
 Devuelve ÚNICAMENTE un JSON válido con esta estructura:
 {{
   "fecha": "YYYY-MM-DD o vacío",
-  "descripcion": "texto corto",
+  "descripcion": "SOLO la descripcion_base (marca/merchant) sin palabras extra",
   "monto": 0,
   "metodo": "efectivo|tarjeta",
   "tarjeta": "nombre o vacío"
@@ -179,6 +194,12 @@ Reglas IMPORTANTES:
 - "metodo" solo puede ser "efectivo" o "tarjeta".
 - Si no menciona tarjeta, deja "tarjeta" como "".
 - "monto" es numérico (sin símbolo de moneda).
+
+Reglas EXTRA para "descripcion":
+- Devuelve SOLO la marca/merchant (ej: "Walmart", "Uber", "Oxxo", "Telcel").
+- NO agregues palabras como "compra en", "pago de", "gasto en", "servicio", etc.
+- Si el texto contiene "en Walmart", la descripcion debe ser exactamente "Walmart".
+- Si el texto menciona un merchant claro, usa ese merchant como descripcion.
 
 Mensaje del usuario:
 \"\"\"{texto}\"\"\"
@@ -204,25 +225,22 @@ Mensaje del usuario:
 
     data = json.loads(raw)
 
-    # normalizar campos base
+    # ---------- Normalizar campos base ----------
     data["descripcion"] = (data.get("descripcion") or "").strip()
     data["metodo"] = (data.get("metodo") or "").strip().lower() or "tarjeta"
     data["tarjeta"] = (data.get("tarjeta") or "").strip()
     data["monto"] = float(data.get("monto") or 0)
 
-    # --------- FECHA: regla fuerte ----------
+    # ---------- FECHA: regla fuerte ----------
     hoy = datetime.now().date().isoformat()
 
-    # Si el texto NO menciona fecha, forzamos hoy
     if not texto_menciona_fecha(texto):
         data["fecha"] = hoy
     else:
-        # Si menciona hoy/ayer/etc, mejor calcularlo en Python
         rel = fecha_relativa_si_aplica(texto)
         if rel:
             data["fecha"] = rel
         else:
-            # si el modelo dio fecha rara o vacía, caemos a hoy
             try:
                 if data.get("fecha"):
                     _ = datetime.fromisoformat(data["fecha"])
@@ -231,7 +249,10 @@ Mensaje del usuario:
             except Exception:
                 data["fecha"] = hoy
 
-    # --------- CATEGORÍA & TIPO (catálogo) ----------
+    # ---------- LIMPIAR DESCRIPCIÓN ----------
+    data["descripcion"] = limpiar_descripcion(data["descripcion"])
+
+    # ---------- CATEGORÍA & TIPO (catálogo) ----------
     desc_norm = normalizar_desc(data["descripcion"])
     categoria = "otros"
     tipo = "otros"
@@ -250,15 +271,11 @@ Mensaje del usuario:
 
 
 def registrar_gasto(texto: str) -> dict:
-    """
-    Interpreta y guarda en la hoja "Gastos AI"
-    """
     if sheet_gastos is None:
         raise RuntimeError("No hay conexión a Google Sheets (sheet_gastos = None).")
 
     data = interpretar_gasto(texto)
 
-    # Ajusta el orden según tu hoja "Gastos AI"
     fila = [
         data["fecha"],
         data["descripcion"],
