@@ -26,28 +26,21 @@ SPREADSHEET_NAME = "Financial Planner ADHV"
 HOJA_GASTOS = "Gastos AI"
 HOJA_CATALOGO = "CatalogoGastos"
 
-# ---------- Conexión a Google Sheets ----------
-
-creds = Credentials.from_service_account_file(
-    CREDS_FILE,
-    scopes=SCOPES,
-)
-gc = gspread.authorize(creds)
-spreadsheet = gc.open(SPREADSHEET_NAME)
-sheet_gastos = spreadsheet.worksheet(HOJA_GASTOS)
+# Conexión a Google Sheets
+try:
+    creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
+    client_gs = gspread.authorize(creds)
+    spreadsheet = client_gs.open(SPREADSHEET_NAME)
+    sheet_gastos = spreadsheet.worksheet(HOJA_GASTOS)
+    print("[INIT] Conexión con Google Sheets OK")
+except Exception as e:
+    print("[INIT ERROR] Google Sheets:", e)
+    raise
 
 # ===================== CARGAR CATÁLOGO =====================
 
 # Diccionario descripcion_normalizada -> (categoria, tipo)
 catalogo_gastos = {}
-
-
-def normalizar_texto(txt: str) -> str:
-    """
-    Pasa a minúsculas y colapsa espacios:
-    '  Gas    estacion   ' -> 'gas estacion'
-    """
-    return " ".join((txt or "").lower().strip().split())
 
 
 def cargar_catalogo():
@@ -65,11 +58,15 @@ def cargar_catalogo():
         for fila in filas:
             if len(fila) < 3:
                 continue
-            descripcion_base = normalizar_texto(fila[0])
+
+            descripcion = (fila[0] or "").strip().lower()
             categoria = (fila[1] or "").strip()
             tipo = (fila[2] or "").strip()
-            if descripcion_base:
-                tmp[descripcion_base] = (categoria, tipo)
+
+            if descripcion:
+                # Normalizamos espacios internos
+                desc_norm = " ".join(descripcion.split())
+                tmp[desc_norm] = (categoria, tipo)
 
         catalogo_gastos = tmp
         print(f"[CATALOGO] Se cargaron {len(catalogo_gastos)} registros.")
@@ -83,23 +80,24 @@ cargar_catalogo()
 # ===================== LÓGICA DE IA =====================
 
 
-def interpretar_gasto(texto: str) -> dict:
+def interpretar_gasto(texto):
     """
     Usa OpenAI para extraer la información del gasto a partir del texto libre.
     1) Pide a OpenAI una estructura JSON básica (fecha, descripción, monto, método, tarjeta).
     2) Con la descripción, busca en el catálogo la categoría y el tipo.
     """
-    prompt = f"""
+
+    system_msg = """
 Eres un asistente que extrae información de gastos personales desde un mensaje en español.
 
-Devuelve UNICAMENTE un JSON válido con esta estructura:
-{{
+Debes devolver EXCLUSIVAMENTE un JSON válido con esta estructura exacta:
+{
   "fecha": "YYYY-MM-DD",
   "descripcion": "texto corto",
   "monto": 0,
   "metodo": "efectivo|tarjeta",
   "tarjeta": "nombre o vacío"
-}}
+}
 
 Reglas:
 - Si el usuario dice una fecha como "el 22 de noviembre", conviértela a formato YYYY-MM-DD (año actual).
@@ -107,37 +105,48 @@ Reglas:
 - Si no menciona tarjeta, deja "tarjeta" como cadena vacía "".
 - "monto" es numérico (sin símbolo de moneda).
 - Usa el año actual si no se especifica.
+- NO agregues texto adicional fuera del JSON.
+"""
 
-Mensaje del usuario:
-\"\"\"{texto}\"\"\""""
+    user_msg = f"Mensaje del usuario:\n\"\"\"{texto}\"\"\""
 
+    # ---------- Llamada a OpenAI con chat.completions ----------
     try:
-        response = client_ai.responses.create(
-            model="gpt-5-mini",
-            input=prompt,
+        resp = client_ai.chat.completions.create(
+            model="gpt-4o-mini",  # si quieres puedes volver a gpt-5-mini
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0,
         )
-        raw = response.output[0].content[0].text
-        print(f"[OPENAI RAW] {raw}")
+
+        raw = resp.choices[0].message.content
+        print("[OPENAI RAW]", raw)
     except Exception as e:
-        # Esto es lo que pasaba cuando tenías problemas de cuota / key, etc.
-        print(f"[OPENAI ERROR] {e}")
+        print("[OPENAI ERROR]", repr(e))
         raise
 
-    # Intentar localizar JSON dentro del texto devuelto
-    try:
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start != -1 and end != -1:
-            json_str = raw[start : end + 1]
-        else:
-            json_str = raw
+    if not raw:
+        raise ValueError("Respuesta vacía de OpenAI")
 
+    # ---------- Extraer el JSON del texto ----------
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1:
+        print("[JSON ERROR] No se encontró JSON en la respuesta:", raw)
+        raise ValueError("No se encontró JSON en la respuesta de OpenAI")
+
+    json_str = raw[start : end + 1]
+
+    try:
         data = json.loads(json_str)
     except Exception as e:
-        print(f"[JSON ERROR] No se pudo parsear JSON: {e}")
+        print("[JSON ERROR] No se pudo parsear el JSON:", e, "| RAW:", raw)
         raise
 
-    # ---------- Normalizar fecha ----------
+    # ---------- Normalizar campos ----------
+    # Fecha
     try:
         if data.get("fecha"):
             _ = datetime.fromisoformat(data["fecha"])
@@ -147,19 +156,27 @@ Mensaje del usuario:
         hoy = datetime.now().date().isoformat()
         data["fecha"] = hoy
 
-    # ---------- Campos básicos ----------
-    data["descripcion"] = (data.get("descripcion") or "").strip()
+    # Descripción, método, tarjeta, monto
+    data["descripcion"] = data.get("descripcion", "").strip()
     data["metodo"] = (data.get("metodo") or "").strip().lower() or "tarjeta"
-    data["tarjeta"] = (data.get("tarjeta") or "").strip()
-    data["monto"] = float(data.get("monto", 0))
+    data["tarjeta"] = data.get("tarjeta", "").strip()
+
+    try:
+        data["monto"] = float(str(data.get("monto", 0)).replace(",", "."))
+    except Exception:
+        data["monto"] = 0.0
 
     # ---------- CATEGORÍA Y TIPO DESDE CATÁLOGO ----------
-    desc_norm = normalizar_texto(data["descripcion"])
-    categoria = "Otros"
-    tipo = "Otros"
+    desc_norm = " ".join(data["descripcion"].lower().split())
+    categoria = "otros"
+    tipo = "otros"
 
     if desc_norm in catalogo_gastos:
-        categoria, tipo = catalogo_gastos[desc_norm]
+        cat_catalogo, tipo_catalogo = catalogo_gastos[desc_norm]
+        if cat_catalogo:
+            categoria = cat_catalogo
+        if tipo_catalogo:
+            tipo = tipo_catalogo
 
     data["categoria"] = categoria
     data["tipo"] = tipo
@@ -167,11 +184,12 @@ Mensaje del usuario:
     return data
 
 
-def registrar_gasto(texto: str) -> dict:
+def registrar_gasto(texto):
     """
-    Llama a OpenAI para interpretar el gasto
-    y lo registra en la pestaña 'Gastos AI' de Google Sheets.
+    Llama a OpenAI para interpretar el gasto,
+    luego lo registra en la pestaña 'Gastos AI' de Google Sheets.
     """
+
     data = interpretar_gasto(texto)
 
     fila = [
@@ -184,7 +202,6 @@ def registrar_gasto(texto: str) -> dict:
         data["tarjeta"],
     ]
 
-    print(f"[GSHEETS] Agregando fila: {fila}")
     sheet_gastos.append_row(fila, value_input_option="USER_ENTERED")
     return data
 
@@ -232,11 +249,10 @@ def webhook_whatsapp():
         resp.message(msg)
 
     except Exception as e:
-        # IMPORTANTÍSIMO PARA DEBUG: ver el error real en Render
         print(f"[ERROR WEBHOOK] {e}")
         resp.message(
             "❌ Ocurrió un error al registrar tu gasto.\n"
-            "Estoy en modo pruebas, intenta de nuevo en unos minutos."
+            "Revisa el formato o intenta de nuevo."
         )
 
     return Response(str(resp), mimetype="application/xml")
