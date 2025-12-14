@@ -92,7 +92,7 @@ MESES_ES = [
 ]
 
 def texto_menciona_fecha(texto: str) -> bool:
-    t = texto.lower()
+    t = (texto or "").lower()
     if any(m in t for m in MESES_ES):
         return True
     if re.search(r"\b\d{4}-\d{1,2}-\d{1,2}\b", t):
@@ -104,19 +104,50 @@ def texto_menciona_fecha(texto: str) -> bool:
     return False
 
 def fecha_relativa(texto: str):
-    t = texto.lower()
+    t = (texto or "").lower()
     hoy = datetime.now().date()
     if "antes de ayer" in t or "antier" in t:
         return (hoy - timedelta(days=2)).isoformat()
     if "ayer" in t:
         return (hoy - timedelta(days=1)).isoformat()
-    if "mañana" in t:
-        return (hoy + timedelta(days=1)).isoformat()
     if "pasado mañana" in t:
         return (hoy + timedelta(days=2)).isoformat()
+    if "mañana" in t:
+        return (hoy + timedelta(days=1)).isoformat()
     if "hoy" in t:
         return hoy.isoformat()
     return None
+
+
+# ===================== PAGADO POR =====================
+
+def detectar_pagado_por(texto: str) -> str:
+    """
+    Si no se menciona, regresa vacío.
+    """
+    t = (texto or "").lower()
+    if "lui" in t or "luisa" in t:
+        return "Lui"
+    if "dani" in t or "daniela" in t:
+        return "Dani"
+    return ""
+
+
+# ===================== MÉTODO =====================
+
+def detectar_metodo(texto: str) -> str:
+    t = (texto or "").lower()
+
+    if "transferencia" in t or "spei" in t or "transfer" in t:
+        return "transferencia"
+
+    if "efectivo" in t:
+        return "efectivo"
+
+    if "tarjeta" in t or "tdd" in t or "tdc" in t:
+        return "tarjeta"
+
+    return ""  # si no se menciona
 
 
 # ===================== DESCRIPCIÓN =====================
@@ -124,8 +155,11 @@ def fecha_relativa(texto: str):
 def limpiar_descripcion(desc: str) -> str:
     d = normalizar_desc(desc)
 
+    # quitar si viene el pagador como "dani renta", "lui uber", etc.
+    d = re.sub(r"^(dani|daniela|lui|luisa)\b", "", d, flags=re.IGNORECASE).strip()
+
     prefijos = [
-        "compra en ", "gasto en ", "pago en ", "pago a ",
+        "compra en ", "gasto en ", "pago en ", "pago a ", "pago de ",
         "servicio de ", "servicio ", "suscripción a ", "suscripcion a ",
         "recarga ", "recarga a ", "en "
     ]
@@ -141,27 +175,15 @@ def limpiar_descripcion(desc: str) -> str:
     return " ".join(w.capitalize() for w in d.split())
 
 
-# ===================== PAGADO POR =====================
-
-def detectar_pagado_por(texto: str) -> str:
-    """
-    Si no se menciona, regresa vacío.
-    """
-    t = texto.lower()
-    if "lui" in t or "luisa" in t:
-        return "Lui"
-    if "dani" in t or "daniela" in t:
-        return "Dani"
-    return ""
-
-
-# ===================== FALLBACK (PLAN B) =====================
+# ===================== FALLBACK (regex) =====================
 
 def extraer_monto_regex(texto: str) -> float:
     """
-    Busca números tipo: 500, 500.50, 1,200
+    Busca números tipo: 500, 500.50, 1,200, $21,500
+    Toma el primer número "grande" que encuentre.
     """
-    t = texto.replace(",", "")
+    t = (texto or "").replace(",", "")
+    # encuentra números con posible decimal
     m = re.search(r"\b(\d+(?:\.\d+)?)\b", t)
     if not m:
         return 0.0
@@ -170,14 +192,34 @@ def extraer_monto_regex(texto: str) -> float:
     except Exception:
         return 0.0
 
+
+def extraer_tarjeta_regex(texto: str) -> str:
+    """
+    Si dice 'tarjeta BBVA' o 'con BBVA', intenta extraer BBVA.
+    """
+    t = texto or ""
+    m = re.search(r"tarjeta\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9&\-_\.]+)", t, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # 'con BBVA' a veces
+    m = re.search(r"\bcon\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9&\-_\.]+)\b", t, flags=re.IGNORECASE)
+    if m and "transfer" not in m.group(1).lower() and "efectivo" not in m.group(1).lower():
+        return m.group(1).strip()
+    return ""
+
+
 def extraer_merchant_regex(texto: str) -> str:
     """
     Intenta:
     - 'en Walmart' -> Walmart
-    - 'Walmart' al final -> Walmart
-    - 'Uber con tarjeta' -> Uber
+    - 'renta ...' -> Renta
+    - 'uber con tarjeta' -> Uber
     """
-    t = texto.strip()
+    t = (texto or "").strip()
+
+    # Caso renta (muy común)
+    if re.search(r"\brenta\b", t, flags=re.IGNORECASE):
+        return "Renta"
 
     # "en X"
     m = re.search(r"\ben\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9&\-\._ ]+)", t, flags=re.IGNORECASE)
@@ -185,19 +227,27 @@ def extraer_merchant_regex(texto: str) -> str:
         candidate = m.group(1)
         candidate = re.split(r"\b(con|por|para|el|la|los|las)\b", candidate, flags=re.IGNORECASE)[0]
         candidate = candidate.strip(" .,-")
+        candidate_norm = normalizar_desc(candidate)
+        if candidate_norm in ["dani", "daniela", "lui", "luisa"]:
+            return ""
         return limpiar_descripcion(candidate)
 
     # "X con tarjeta"
     m = re.search(r"\b([A-Za-zÁÉÍÓÚÑáéíóúñ0-9&\-\._ ]+)\s+con\s+tarjeta\b", t, flags=re.IGNORECASE)
     if m:
         candidate = m.group(1).strip(" .,-")
-        # quitar posibles palabras al inicio
         candidate = re.sub(r"^(lui|luisa|dani|daniela)\b", "", candidate, flags=re.IGNORECASE).strip()
+        candidate_norm = normalizar_desc(candidate)
+        if candidate_norm in ["dani", "daniela", "lui", "luisa"]:
+            return ""
         return limpiar_descripcion(candidate)
 
-    # último token razonable
+    # último token razonable (evitar nombres)
     words = re.findall(r"[A-Za-zÁÉÍÓÚÑáéíóúñ0-9&\-\._]+", t)
     if words:
+        last = words[-1].lower()
+        if last in ["dani", "daniela", "lui", "luisa"]:
+            return ""
         return limpiar_descripcion(words[-1])
 
     return ""
@@ -206,25 +256,27 @@ def extraer_merchant_regex(texto: str) -> str:
 # ===================== IA =====================
 
 def interpretar_gasto(texto: str) -> dict:
-    # ✅ AQUÍ estaba el bug: no estábamos metiendo el mensaje del usuario.
     prompt = f"""
 Eres un asistente que extrae información de gastos personales desde un mensaje en español.
 
 Devuelve ÚNICAMENTE un JSON válido con esta estructura:
 {{
   "fecha": "YYYY-MM-DD o vacío",
-  "descripcion": "SOLO la marca o merchant (ej: Walmart, Uber, Oxxo)",
+  "descripcion": "SOLO la marca o merchant (ej: Walmart, Uber, Oxxo, Renta)",
   "monto": 0,
-  "metodo": "efectivo|tarjeta",
+  "metodo": "efectivo|tarjeta|transferencia",
   "tarjeta": "nombre o vacío"
 }}
 
 Reglas:
 - SOLO llena "fecha" si el usuario menciona fecha; si NO, devuelve "fecha": "".
 - "descripcion" debe ser SOLO la marca/merchant. NO agregues palabras como compra/pago/gasto.
+- NUNCA uses 'Dani' o 'Lui' como descripcion; esos son pagadores.
+- Si dice transferencia o SPEI -> metodo = "transferencia".
+- Si dice efectivo -> metodo = "efectivo".
+- Si dice tarjeta -> metodo = "tarjeta".
 - "monto" es numérico.
 - Si no se menciona tarjeta, "tarjeta" debe ser "".
-- "metodo" solo "efectivo" o "tarjeta".
 
 Mensaje del usuario:
 \"\"\"{texto}\"\"\"
@@ -237,28 +289,31 @@ Mensaje del usuario:
 
     raw = getattr(response, "output_text", None)
     if not raw:
-        # fallback por si el SDK devuelve otra estructura
         raw = response.output[0].content[0].text
 
-    # extraer json
     start = raw.find("{")
     end = raw.rfind("}")
-    if start != -1 and end != -1:
-        raw_json = raw[start:end + 1]
-    else:
-        raw_json = raw
+    raw_json = raw[start:end + 1] if (start != -1 and end != -1) else raw
 
     data = json.loads(raw_json)
 
-    # ---- Normalización base ----
+    # ---- Normalizar base ----
     data["descripcion"] = limpiar_descripcion(data.get("descripcion", ""))
-    data["metodo"] = (data.get("metodo") or "tarjeta").lower().strip()
     data["tarjeta"] = (data.get("tarjeta") or "").strip()
 
+    # monto
     try:
         data["monto"] = float(data.get("monto") or 0)
     except Exception:
         data["monto"] = 0.0
+
+    # método: lo forzamos por texto si aplica
+    data["metodo"] = (data.get("metodo") or "").lower().strip()
+    metodo_txt = detectar_metodo(texto)
+    if metodo_txt:
+        data["metodo"] = metodo_txt
+    if data["metodo"] not in ["efectivo", "tarjeta", "transferencia", ""]:
+        data["metodo"] = ""
 
     # ---- Fecha ----
     hoy = datetime.now().date().isoformat()
@@ -277,15 +332,20 @@ Mensaje del usuario:
             except Exception:
                 data["fecha"] = hoy
 
-    # ---- Pagado por (vacío si no se menciona) ----
+    # ---- Pagado por ----
     data["pagado_por"] = detectar_pagado_por(texto)
 
-    # ---- FALLBACK si OpenAI regresó vacío ----
-    if not data["descripcion"]:
+    # ---- FALLBACKS si vienen vacíos ----
+    # Si descripcion quedó como "Dani/Lui" o vacío, extraer por regex
+    if normalizar_desc(data["descripcion"]) in ["dani", "daniela", "lui", "luisa", ""]:
         data["descripcion"] = extraer_merchant_regex(texto)
 
     if not data["monto"] or data["monto"] == 0.0:
         data["monto"] = extraer_monto_regex(texto)
+
+    # tarjeta fallback
+    if "tarjeta" in (texto or "").lower() and not data["tarjeta"]:
+        data["tarjeta"] = extraer_tarjeta_regex(texto)
 
     # ---- Catálogo ----
     desc_norm = normalizar_desc(data["descripcion"])
@@ -293,16 +353,13 @@ Mensaje del usuario:
     if desc_norm in catalogo_gastos:
         categoria, tipo = catalogo_gastos[desc_norm]
 
+    # Regla útil: si detecta "renta" y no hay match, puedes forzar categoria/tipo
+    # (si ya lo agregas al catálogo, esto no es necesario)
+    if desc_norm == "renta" and (categoria == "otros" and tipo == "otros"):
+        categoria, tipo = "Hogar", "Renta"
+
     data["categoria"] = categoria
     data["tipo"] = tipo
-
-    # Defaults de método/tarjeta si no vinieron
-    if "tarjeta" in texto.lower() and not data["tarjeta"]:
-        # si el texto dice tarjeta pero no especifica cuál, al menos deja vacío
-        data["tarjeta"] = ""
-
-    if data["metodo"] not in ["efectivo", "tarjeta"]:
-        data["metodo"] = "tarjeta"
 
     return data
 
@@ -313,18 +370,17 @@ def registrar_gasto(texto: str) -> dict:
 
     data = interpretar_gasto(texto)
 
-    # IMPORTANTE: en tu Google Sheet, agrega columna "pagado_por"
-    # Orden recomendado:
-    # A fecha, B descripcion, C categoria, D tipo, E pagado_por, F monto, G metodo, H tarjeta
+    # Orden recomendado en hoja "Gastos AI":
+    # A fecha | B descripcion | C categoria | D tipo | E pagado_por | F monto | G metodo | H tarjeta
     fila = [
-        data["fecha"],
-        data["descripcion"],
-        data["categoria"],
-        data["tipo"],
-        data["pagado_por"],   # 👈 NUEVO (vacío si no se menciona)
-        data["monto"],
-        data["metodo"],
-        data["tarjeta"],
+        data.get("fecha", ""),
+        data.get("descripcion", ""),
+        data.get("categoria", "otros"),
+        data.get("tipo", "otros"),
+        data.get("pagado_por", ""),
+        data.get("monto", 0),
+        data.get("metodo", ""),
+        data.get("tarjeta", ""),
     ]
 
     sheet_gastos.append_row(fila, value_input_option="USER_ENTERED")
@@ -359,14 +415,14 @@ def webhook_whatsapp():
 
         msg += (
             f"• Monto: {datos['monto']}\n"
-            f"• Método: {datos['metodo']}\n"
+            f"• Método: {datos['metodo'] or 'N/A'}\n"
             f"• Tarjeta: {datos['tarjeta'] or 'N/A'}"
         )
 
         resp.message(msg)
 
     except Exception as e:
-        print("[ERROR]", e)
+        print("[ERROR WEBHOOK]", e)
         resp.message("❌ Ocurrió un error al registrar el gasto.")
 
     return Response(str(resp), mimetype="application/xml")
